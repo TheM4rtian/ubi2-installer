@@ -186,11 +186,69 @@ build_factory_volume() {
   cp "$FACTORY_BLOB" "$factory_bin_path"
 }
 
+# Verify MTD geometry matches expected device parameters for W25N04L (optional check).
+# If W25N04L-like part detected, assert expected geometry (writesize=2048, oobsize=64, erasesize=131072).
+verify_mtd_geometry() {
+  mtddev="$1"    # e.g. /dev/mtd2
+  expected_writesize=2048
+  expected_oobsize=64
+  expected_erasesize=131072
+
+  mtdname="$(basename "$mtddev")"    # mtd2
+  sys_mtd="/sys/class/mtd/$mtdname"
+
+  if [ ! -d "$sys_mtd" ]; then
+    log "Warning: cannot find sysfs for $mtddev ($sys_mtd); skipping geometry self-test."
+    return 0
+  fi
+
+  name="$(cat "$sys_mtd/name" 2>/dev/null || echo "")"
+  writesize=$(cat "$sys_mtd/writesize" 2>/dev/null || echo "")
+  oobsize=$(cat "$sys_mtd/oobsize" 2>/dev/null || echo "")
+  erasesize=$(cat "$sys_mtd/erasesize" 2>/dev/null || echo "")
+
+  # If the MTD name contains 'w25' or 'w25n' or 'winbond', warn the user
+  if echo "$name" | grep -Ei 'w25n|w25|winbond' >/dev/null 2>&1; then
+    log "Detected flash chip name: $name"
+    # Print detected geometry
+    log "Detected geometry: writesize=$writesize oobsize=$oobsize erasesize=$erasesize"
+    # If geometry differs from expected for W25N04L, error and explain
+    if [ "$writesize" != "$expected_writesize" ] || [ "$oobsize" != "$expected_oobsize" ] || [ "$erasesize" != "$expected_erasesize" ]; then
+      die "Detected Winbond-like chip ($name) but MTD geometry does not match W25N04L expectations.
+Expected: writesize=$expected_writesize oobsize=$expected_oobsize erasesize=$expected_erasesize
+Found: writesize=$writesize oobsize=$oobsize erasesize=$erasesize
+
+This typically indicates a kernel driver/DT/ecc mismatch. Ensure the kernel spinand driver exposes the correct geometry and that controller ECC mode is configured correctly."
+    fi
+  fi
+
+  return 0
+}
+
 install_prepare_ubi() {
   mtddev="$1"
 
   log "Formatting NAND and creating UBI volumes on $mtddev..."
   [ -e /sys/class/ubi/ubi0 ] && ubidetach -p "$mtddev"
+
+  # Attempt self-test: if the blob is Winbond-like, assert expected geometry to avoid corrupt UBI.
+  verify_mtd_geometry "$mtddev"
+
+  # derive MTD geometry from sysfs, fallback to previous hardcoded value
+  mtdname="$(basename "$mtddev")"      # e.g. mtd2
+  sys_mtd="/sys/class/mtd/$mtdname"
+  if [ -d "$sys_mtd" ]; then
+    writesize=$(cat "$sys_mtd/writesize" 2>/dev/null || echo 2048)
+    oobsize=$(cat "$sys_mtd/oobsize" 2>/dev/null || echo 64)
+    erasesize=$(cat "$sys_mtd/erasesize" 2>/dev/null || echo 131072)
+    log "Detected MTD geometry: writesize=$writesize oobsize=$oobsize erasesize=$erasesize"
+    # Historically the script used 126976 for -s (131072 - 4096). Keep that reservation:
+    pebb_data_size=$((erasesize - 4096))
+  else
+    # fallback if sysfs not present
+    log "Warning: cannot read /sys/class/mtd/$mtdname; using legacy sizes"
+    pebb_data_size=126976
+  fi
 
   ubiformat "$mtddev"
   ubiattach -p "$mtddev"
@@ -199,9 +257,10 @@ install_prepare_ubi() {
 
   [ -e /dev/ubi0 ] || ubi_mknod ubi0
 
-  ubimkvol /dev/ubi0 -n 0 -s 126976 -N ubootenv
+  # use computed per-PEB data size so volumes align to eraseblock geometry
+  ubimkvol /dev/ubi0 -n 0 -s "$pebb_data_size" -N ubootenv
   ubi_mknod ubi0_0
-  ubimkvol /dev/ubi0 -n 1 -s 126976 -N ubootenv2
+  ubimkvol /dev/ubi0 -n 1 -s "$pebb_data_size" -N ubootenv2
   ubi_mknod ubi0_1
 }
 
@@ -226,7 +285,13 @@ install_write_recovery() {
 }
 
 install_write_openwrt() {
-  ubimkvol /dev/ubi0 -n 4 -s 126976 -N fit
+  if [ -n "$pebb_data_size" ]; then
+    fit_size="$pebb_data_size"
+  else
+    fit_size=126976
+  fi
+
+  ubimkvol /dev/ubi0 -n 4 -s "$fit_size" -N fit
   ubi_mknod ubi0_4
 
   # Load OpenWrt upgrade helpers only when needed
